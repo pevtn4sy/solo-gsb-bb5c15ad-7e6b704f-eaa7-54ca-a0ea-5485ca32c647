@@ -333,6 +333,62 @@ def test_zero_duration_multiple_inserts(client):
     assert [(c["start"], c["end"]) for c in chars] == [(0, 0), (0, 0)]
 
 
+def test_zero_width_gap_between_anchors(client):
+    # 相邻锚点首尾相接（end==start），空档宽度为 0，多个新增字共享该时点
+    payload = {
+        "recognized": rc([("a", 100, 200), ("c", 200, 300)]),
+        "total_duration": 400,
+        "revised_text": "axyc",
+    }
+    r = client.post("/align", json=payload)
+    assert r.status_code == 200, r.text
+    x, y = r.json()["chars"][1], r.json()["chars"][2]
+    assert x["source"] == y["source"] == "computed"
+    assert (x["start"], x["end"]) == (200, 200)
+    assert (y["start"], y["end"]) == (200, 200)
+
+
+def test_mixed_anchors_and_runs_even_split(client):
+    # 前缀新增 / 中间多字均分 / 后缀新增 三种连续段并存
+    payload = {
+        "recognized": rc([("a", 100, 200), ("c", 700, 800)]),
+        "total_duration": 1000,
+        "revised_text": "uvaxycw",
+    }
+    r = client.post("/align", json=payload)
+    assert r.status_code == 200, r.text
+    times = [(c["source"], c["start"], c["end"]) for c in r.json()["chars"]]
+    assert times == [
+        ("computed", 0, 50),       # u: [0,100] / 2
+        ("computed", 50, 100),     # v
+        ("matched", 100, 200),     # a
+        ("computed", 200, 450),    # x: [200,700] / 2
+        ("computed", 450, 700),    # y
+        ("matched", 700, 800),     # c
+        ("computed", 800, 1000),   # w: [800,1000]
+    ]
+
+
+def test_long_inserted_text_is_linear(client):
+    # 回归：recognized=[] 时旧实现对每个新增字线性查找锚点并整段重算均分点，
+    # 数千字呈 O(n^2) 退化；现在按连续新增段单次赋时，应在毫秒量级完成。
+    n = 5000
+    r = _post(client, {"recognized": [], "total_duration": 1_000_000,
+                       "revised_text": "字" * n})
+    assert r.status_code == 200, r.text
+    chars = r.json()["chars"]
+    assert len(chars) == n
+    assert all(c["source"] == "computed" for c in chars)
+    assert (chars[0]["start"], chars[0]["end"]) == (0, 200)
+    assert (chars[-1]["start"], chars[-1]["end"]) == (999800, 1_000_000)
+    # 时间不回退、不越界
+    prev_end = 0
+    for c in chars:
+        assert 0 <= c["start"] <= c["end"] <= 1_000_000
+        assert c["start"] >= prev_end
+        prev_end = c["end"]
+
+
 # ---------------------------------------------------------------------------
 # 引语近似定位
 # ---------------------------------------------------------------------------
