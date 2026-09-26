@@ -78,61 +78,48 @@ def build_timeline(req: AlignRequest, backend: str) -> dict:
 
     mapping = align_chars(source, target)
 
-    # 锚点：对齐到识别字符（完全匹配或替换纠错）的修订字符。
-    anchors: dict[int, int] = {}  # 修订下标 -> 识别下标
-    for j, src_idx in enumerate(mapping):
-        if src_idx >= 0:
-            anchors[j] = src_idx
-
-    matched_count = len(anchors)
+    matched_count = sum(1 for src_idx in mapping if src_idx >= 0)
     inserted_count = len(target) - matched_count
     deleted_count = len(source) - matched_count
 
+    # 单次顺序扫描：匹配字符直接取识别时间；连续新增字符按段处理——
+    # 段边界（相邻匹配锚点或录音边界）与段内均分点每段只算一次，再逐字赋时。
     chars: list[RevisedCharTimeline] = []
-    anchor_positions = sorted(anchors)
-
-    for j, ch in enumerate(target):
-        src_idx = anchors.get(j)
-        if src_idx is not None:
+    n = len(target)
+    j = 0
+    while j < n:
+        src_idx = mapping[j]
+        if src_idx >= 0:
             item = req.recognized[src_idx]
             chars.append(RevisedCharTimeline(
-                char=ch,
+                char=target[j],
                 start=item.start,
                 end=item.end,
                 source="matched",
                 matched_index=src_idx,
                 recognized_char=item.char,
             ))
+            j += 1
             continue
 
-        # 找到前后相邻锚点，确定该新增字符所处空档的边界。
-        prev_pos = next((p for p in reversed(anchor_positions) if p < j), None)
-        next_pos = next((p for p in anchor_positions if p > j), None)
+        # 连续新增段 [j, run_end)：两侧为相邻匹配锚点或录音边界（0 / 总时长）。
+        run_end = j + 1
+        while run_end < n and mapping[run_end] < 0:
+            run_end += 1
 
-        if prev_pos is not None and next_pos is not None:
-            gap_left = req.recognized[anchors[prev_pos]].end
-            gap_right = req.recognized[anchors[next_pos]].start
-        elif prev_pos is not None:
-            gap_left = req.recognized[anchors[prev_pos]].end
-            gap_right = total
-        elif next_pos is not None:
-            gap_left = 0
-            gap_right = req.recognized[anchors[next_pos]].start
-        else:
-            gap_left, gap_right = 0, total
+        gap_left = req.recognized[mapping[j - 1]].end if j > 0 else 0
+        gap_right = (req.recognized[mapping[run_end]].start
+                     if run_end < n else total)
 
-        # 空档内连续新增字符的数量及当前字符序号。
-        run = j - (prev_pos if prev_pos is not None else -1)
-        run_total = (next_pos if next_pos is not None else len(target)) - (
-            prev_pos if prev_pos is not None else -1) - 1
-        seg = _even_points(gap_left, gap_right, run_total)[run - 1]
-
-        chars.append(RevisedCharTimeline(
-            char=ch,
-            start=seg[0],
-            end=seg[1],
-            source="computed",
-        ))
+        for k, (seg_start, seg_end) in enumerate(
+                _even_points(gap_left, gap_right, run_end - j)):
+            chars.append(RevisedCharTimeline(
+                char=target[j + k],
+                start=seg_start,
+                end=seg_end,
+                source="computed",
+            ))
+        j = run_end
 
     return {
         "total_duration": total,
